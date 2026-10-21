@@ -172,23 +172,6 @@ def _safe_gemini_diagnostic(exc: Exception, api_key: str) -> str:
     return re.sub(r"\s+", " ", message).strip()[:500]
 
 
-CRACK_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "summary": {"type": "STRING"},
-        "possible_crack_types": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-            "type": {"type": "STRING"}, "likelihood": {"type": "STRING"}, "observation": {"type": "STRING"}
-        }, "required": ["type", "likelihood", "observation"]}},
-        "severity": {"type": "STRING"},
-        "probable_causes": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "recommended_repairs": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "urgency": {"type": "STRING"},
-        "limitations": {"type": "STRING"},
-    },
-    "required": ["summary", "possible_crack_types", "severity", "probable_causes", "recommended_repairs", "urgency", "limitations"],
-}
-
-
 def analyze_image(image_bytes: bytes, mime: str, mode: str, filename: str) -> dict[str, Any]:
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
@@ -211,12 +194,17 @@ def analyze_image(image_bytes: bytes, mime: str, mode: str, filename: str) -> di
             # Send original bytes with their actual upload MIME type rather than
             # relying on implicit PIL conversion; uploads are limited to JPG and PNG.
             normalized_mime = (mime or "").strip().lower()
+            normalized_mime = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg"}.get(normalized_mime, normalized_mime)
+            if not normalized_mime:
+                suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+                normalized_mime = "image/jpeg" if suffix in {"jpg", "jpeg"} else "image/png" if suffix == "png" else ""
             if normalized_mime not in {"image/jpeg", "image/png"}:
                 raise ValueError("Unsupported image MIME type; upload a JPG or PNG image.")
             image_part = types.Part.from_bytes(data=image_bytes, mime_type=normalized_mime)
-            prompt = """Inspect this image for visible cracking and provide preliminary triage only. Do not diagnose structural safety from a photo; distinguish visible observations from possibilities and say when the image is insufficient. Populate every requested field; use an empty list only when no item can be responsibly identified. Return a concise, conservative assessment, and state that a licensed structural engineer must verify it."""
+            prompt = """Inspect this image for visible cracking and provide preliminary triage only. Do not diagnose structural safety from a photo; distinguish visible observations from possibilities and say when the image is insufficient. Return ONLY valid JSON with keys: summary (string), possible_crack_types (array of objects type/likelihood/observation), severity (string), probable_causes (array of strings), recommended_repairs (array of strings), urgency (string), limitations (string). Populate every field, use an empty list only when an item cannot be responsibly identified, and state that a licensed structural engineer must verify any recommendations."""
             contents = [prompt, image_part]
-            config = types.GenerateContentConfig(response_mime_type="application/json", response_schema=CRACK_RESPONSE_SCHEMA)
+            # Match the working safety request's supported JSON-mode configuration.
+            config = types.GenerateContentConfig(response_mime_type="application/json")
         else:
             raise ValueError("Unknown image analysis mode.")
 
