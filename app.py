@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -143,7 +144,10 @@ def demo_crack(filename: str) -> dict[str, Any]:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.I)
+    fence = chr(96) * 3
+    cleaned = text.strip()
+    cleaned = re.sub(r"^\s*" + re.escape(fence) + r"(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*" + re.escape(fence) + r"\s*$", "", cleaned)
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start < 0 or end <= start:
         raise ValueError("The AI returned an unreadable report. Please try again.")
@@ -153,45 +157,93 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
+def _safe_gemini_diagnostic(exc: Exception, api_key: str) -> str:
+    """Keep useful provider error text while redacting common credential formats."""
+    message = str(exc) or "No provider message was supplied."
+    if api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    message = re.sub(r"(?i)AIza[0-9A-Za-z_-]{12,}|AQ\.[0-9A-Za-z_-]{8,}", "[REDACTED]", message)
+    message = re.sub(r"(?i)([?&](?:key|api_key|token|access_token|client_secret|secret)=)[^&\s]+", r"\1[REDACTED]", message)
+    message = re.sub(r"(?i)\bBearer\s+[^,\s]+", "Bearer [REDACTED]", message)
+    message = re.sub(
+        r"(?i)(api[_ -]?key|x-goog-api-key|authorization|access[_ -]?token|client[_ -]?secret|secret)(\s*[:=]\s*)['\"]?[^,;\s'\"]+",
+        r"\1\2[REDACTED]", message,
+    )
+    return re.sub(r"\s+", " ", message).strip()[:500]
+
+
+CRACK_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {"type": "STRING"},
+        "possible_crack_types": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "type": {"type": "STRING"}, "likelihood": {"type": "STRING"}, "observation": {"type": "STRING"}
+        }, "required": ["type", "likelihood", "observation"]}},
+        "severity": {"type": "STRING"},
+        "probable_causes": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "recommended_repairs": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "urgency": {"type": "STRING"},
+        "limitations": {"type": "STRING"},
+    },
+    "required": ["summary", "possible_crack_types", "severity", "probable_causes", "recommended_repairs", "urgency", "limitations"],
+}
+
+
 def analyze_image(image_bytes: bytes, mime: str, mode: str, filename: str) -> dict[str, Any]:
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         return demo_safety(filename) if mode == "safety" else demo_crack(filename)
+
+    phase = "SDK initialization"
+    model = get_secret("GEMINI_MODEL") or MODEL_DEFAULT
     try:
         from google import genai
         from google.genai import types
-        from PIL import Image
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        phase = "image preparation"
         if mode == "safety":
+            # Preserve the working safety image path.
+            from PIL import Image
+            image = Image.open(BytesIO(image_bytes)).convert("RGB")
             prompt = """Inspect this construction site image for a preliminary visual safety audit. Do not assert details that are not visible; say not assessable where needed. Return ONLY valid JSON with keys: safety_score (integer 0-100), summary (string), ppe_checklist (array of objects item/status/observation), hazards (array of objects hazard/severity [Critical/High/Medium/Low]/location/corrective_action), corrective_actions (array of strings), limitations (string). Prioritize immediate life-safety risks. This is not a substitute for an on-site competent-person inspection."""
+            contents = [prompt, image]
+            config = types.GenerateContentConfig(response_mime_type="application/json")
+        elif mode == "crack":
+            # Send original bytes with their actual upload MIME type rather than
+            # relying on implicit PIL conversion; uploads are limited to JPG and PNG.
+            normalized_mime = (mime or "").strip().lower()
+            if normalized_mime not in {"image/jpeg", "image/png"}:
+                raise ValueError("Unsupported image MIME type; upload a JPG or PNG image.")
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type=normalized_mime)
+            prompt = """Inspect this image for visible cracking and provide preliminary triage only. Do not diagnose structural safety from a photo; distinguish visible observations from possibilities and say when the image is insufficient. Populate every requested field; use an empty list only when no item can be responsibly identified. Return a concise, conservative assessment, and state that a licensed structural engineer must verify it."""
+            contents = [prompt, image_part]
+            config = types.GenerateContentConfig(response_mime_type="application/json", response_schema=CRACK_RESPONSE_SCHEMA)
         else:
-            prompt = """Inspect this image for visible cracking and provide preliminary triage only. Do not diagnose structural safety from a photo; distinguish observations from possibilities and say when the image is insufficient. Return ONLY valid JSON with keys: summary (string), possible_crack_types (array of objects type/likelihood/observation), severity (string), probable_causes (array of strings), recommended_repairs (array of strings), urgency (string), limitations (string). Include conservative escalation advice."""
-        model = get_secret("GEMINI_MODEL") or MODEL_DEFAULT
+            raise ValueError("Unknown image analysis mode.")
+
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=[prompt, image],
-            # Gemini 3 models use their default sampling settings; JSON mode keeps
-            # the report machine-readable without relying on unsupported tuning.
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        phase = "Gemini request"
+        response = client.models.generate_content(model=model, contents=contents, config=config)
+        phase = "response parsing"
         result = _extract_json(response.text or "")
         result["analysis_mode"] = "Gemini AI"
         result["analysis_model"] = model
         return result
-    except Exception:
-        # Keep provider exceptions out of the UI and logs. Never echo request details.
-        # The deterministic fallback makes clear that the uploaded image was not analyzed.
+    except Exception as exc:
+        diagnostic = _safe_gemini_diagnostic(exc, api_key)
+        raw_status = getattr(exc, "status_code", None)
+        status = str(raw_status) if isinstance(raw_status, int) or (isinstance(raw_status, str) and re.fullmatch(r"[1-5][0-9]{2}", raw_status)) else "unavailable"
+        logging.getLogger(__name__).warning(
+            "Gemini %s analysis failed during %s (exception_type=%s, status=%s): %s",
+            mode, phase, type(exc).__name__, status, diagnostic,
+        )
         report = demo_safety(filename) if mode == "safety" else demo_crack(filename)
         report["analysis_mode"] = "Demo fallback"
         report["fallback_notice"] = (
             "Gemini could not complete this request. This fixed demo report is not based on the uploaded image. "
-            "Check the server-side API configuration and try again."
+            "Check the server logs for a redacted diagnostic and try again."
         )
         report["limitations"] += " Gemini did not analyze the uploaded image; this is a deterministic sample."
         return report
-
-
 def metric(label: str, value: str) -> None:
     st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
 
