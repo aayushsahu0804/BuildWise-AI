@@ -256,18 +256,46 @@ def section_header(kicker: str, title: str, subtitle: str) -> None:
     st.markdown(f'<div class="eyebrow" style="color:#1c7153">{kicker}</div><h1 style="margin:.1rem 0 .8rem">{title}</h1><div class="section-note">{subtitle}</div>', unsafe_allow_html=True)
 
 
+def gemini_status_text(key_configured: bool, latest_request: str) -> tuple[str, str]:
+    """Describe configuration separately from actual request outcomes."""
+    if not key_configured:
+        return "🔴 API key missing", "Image analysis uses demo output; no Gemini request has been made."
+    if latest_request == "failed":
+        return "🔴 Latest Gemini request failed", "The latest attempted Gemini analysis returned a demo fallback. See server logs for a redacted diagnostic."
+    if latest_request == "succeeded":
+        return "🟢 Gemini request succeeded during this session", "The most recent Gemini image request completed successfully."
+    return "🟡 API key configured · no successful request yet", "Key presence alone does not confirm access. Run an image analysis to verify the request."
+
+
+def record_gemini_request(report: dict[str, Any]) -> None:
+    """Persist only the latest real Gemini request outcome for this session."""
+    mode = report.get("analysis_mode")
+    if mode == "Gemini AI":
+        st.session_state["gemini_latest_request_status"] = "succeeded"
+    elif mode == "Demo fallback":
+        st.session_state["gemini_latest_request_status"] = "failed"
+
+
+def render_gemini_status(status_slot, key_configured: bool) -> None:
+    label, detail = gemini_status_text(
+        key_configured,
+        st.session_state.get("gemini_latest_request_status", "not_attempted"),
+    )
+    with status_slot.container():
+        st.markdown("**Gemini status**")
+        st.markdown(label)
+        st.caption(detail)
+
+
 st.sidebar.markdown("## 🏗️ BuildWise AI")
 st.sidebar.caption("Construction intelligence platform")
 page = st.sidebar.radio("Navigate", ["Overview", "Site Safety Audit", "Crack Analysis", "Planning & Valuation", "Construction Assistant"], label_visibility="collapsed")
 api_available = bool(get_secret("GEMINI_API_KEY"))
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Gemini configuration**")
-if api_available:
-    st.sidebar.markdown("🟡 API key configured · request unverified")
-    st.sidebar.caption("The image modules confirm Gemini availability per request. Failed requests are labelled as demo fallback.")
-else:
-    st.sidebar.markdown("🟠 Demo mode · no API key configured")
-    st.sidebar.caption("Image uploads are not analyzed; the app returns fixed demo examples.")
+if "gemini_latest_request_status" not in st.session_state:
+    st.session_state["gemini_latest_request_status"] = "not_attempted"
+gemini_status_slot = st.sidebar.empty()
+render_gemini_status(gemini_status_slot, api_available)
 st.sidebar.markdown("---")
 st.sidebar.caption("Planning aid only. Verify decisions with qualified local professionals.")
 
@@ -310,6 +338,8 @@ elif page in ("Site Safety Audit", "Crack Analysis"):
                         report["image_sha256"] = hashlib.sha256(uploaded.getvalue()).hexdigest()
                         report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
                         st.session_state["last_image_report"] = report
+                        record_gemini_request(report)
+                        render_gemini_status(gemini_status_slot, api_available)
                     except RuntimeError as exc:
                         st.error(str(exc))
             report = st.session_state.get("last_image_report")
